@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Create CI .env
+        run: |
+          cp .env.example .env
+          sed -i "s/change-me-app/ci-$(openssl rand -hex 8)/; s/change-me-demo-admin/ci-$(openssl rand -hex 8)/; s/change-me-demo-ro/ci-$(openssl rand -hex 8)/" .env
+      - run: docker compose up -d --wait app-db demo-warehouse
+      - run: uv sync --frozen
+      - name: Unit + integration tests
+        run: uv run pytest -v
+
+  evals:
+    # Real LLM calls cost money: run on main and when requested manually.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-evals')
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Create CI .env
+        run: |
+          cp .env.example .env
+          sed -i "s/change-me-app/ci-$(openssl rand -hex 8)/; s/change-me-demo-admin/ci-$(openssl rand -hex 8)/; s/change-me-demo-ro/ci-$(openssl rand -hex 8)/" .env
+          uv run --no-project --with cryptography python -c "from cryptography.fernet import Fernet; print('APP_SECRET_KEY=' + Fernet.generate_key().decode())" >> .env
+          echo "APPROVAL_SIGNING_KEY=$(openssl rand -hex 32)" >> .env
+      - run: docker compose up -d --wait app-db demo-warehouse
+      - run: uv sync --frozen
+      - name: Agent evals (fail on regression)
+        run: uv run python -m evals.run --judge
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: evals/results/latest.json
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - run: npm run build
+
+  docker:
+    needs: [lint, test, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build API/MCP image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: data-analyst-agent:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: web
+          push: false
+          tags: data-analyst-web:${{ github.sha }}

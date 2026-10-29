@@ -1,0 +1,104 @@
+# Databases only (local dev):       docker compose up -d --wait
+# Whole stack (api + mcp + web too): docker compose --profile app up -d --build --wait
+
+services:
+  # Our own database: checkpoints, data-source registry, document embeddings, audit log.
+  app-db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ${APP_DB_USER}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
+      POSTGRES_DB: ${APP_DB_NAME}
+    ports:
+      # 5433 on your Mac -> 5432 in the container (your local Postgres already owns 5432).
+      - "${APP_DB_PORT:-5433}:5432"
+    volumes:
+      - app-data:/var/lib/postgresql/data
+      - ./db/app:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # An EXAMPLE plugged-in data source. In real use this is the user's database,
+  # running somewhere we don't control. Used for local demos, tests and evals.
+  demo-warehouse:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: demo_admin
+      POSTGRES_PASSWORD: ${DEMO_DB_ADMIN_PASSWORD}
+      POSTGRES_DB: demo_retail
+      ANALYST_RO_PASSWORD: ${DEMO_DB_RO_PASSWORD}
+    ports:
+      - "${DEMO_DB_PORT:-5434}:5432"
+    volumes:
+      - demo-data:/var/lib/postgresql/data
+      # Scripts here run once, in filename order, on the FIRST start (empty volume only).
+      - ./examples/demo_warehouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo_admin -d demo_retail"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The only service that touches user data sources and holds the credential-encryption key.
+  mcp:
+    profiles: ["app"]
+    build: .
+    command: ["python", "-m", "analyst.mcp_server"]
+    env_file: .env
+    environment:
+      APP_DB_HOST: app-db
+      APP_DB_PORT: "5432"
+      DEMO_DB_HOST: demo-warehouse
+      DEMO_DB_PORT: "5432"
+      MCP_HOST: 0.0.0.0
+      # 127.0.0.1 inside a container is the container itself; reach the embedder on the host instead.
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL_DOCKER:-http://host.docker.internal:8008/v1}
+      LOCAL_DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      app-db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('localhost', 8001), 2)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Agents + HTTP API. Talks to data only through the MCP server.
+  api:
+    profiles: ["app"]
+    build: .
+    env_file: .env
+    environment:
+      APP_DB_HOST: app-db
+      APP_DB_PORT: "5432"
+      DEMO_DB_HOST: demo-warehouse
+      DEMO_DB_PORT: "5432"
+      MCP_URL: http://mcp:8001/mcp
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL_DOCKER:-http://host.docker.internal:8008/v1}
+      APP_SECRET_KEY: ""  # the API never needs to decrypt source credentials
+    ports:
+      - "8000:8000"
+    depends_on:
+      app-db: { condition: service_healthy }
+      mcp: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=2)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    profiles: ["app"]
+    build: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  app-data:
+  demo-data:

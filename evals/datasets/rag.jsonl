@@ -1,0 +1,4 @@
+{"id": "rag-01", "question": "According to our returns policy, what is the return window for orders placed in India after July 2025?", "must_include": ["14"], "expected_doc": "returns_policy.md"}
+{"id": "rag-02", "question": "How does our data dictionary define an active customer?", "must_include": ["90"], "expected_doc": "data_dictionary.md"}
+{"id": "rag-03", "question": "Who should I contact about personal data access requests?", "must_include": ["data-governance@example.com"], "expected_doc": "data_dictionary.md"}
+{"id": "rag-04", "question": "Why did we shorten the return window in India?", "must_include": ["return"], "expected_doc": "returns_policy.md"}
